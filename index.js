@@ -39,31 +39,95 @@ async function main() {
   await collection.add({ ids, documents, metadatas });
   console.log(`✅ ${documents.length} documents indexés.`);
 
-  // ─── Fonction RAG ─────────────────────────────────────────
+  // ─── Fonction RAG Avancée ─────────────────────────────────
   async function askRAG(question) {
-    const results = await collection.query({
-      queryTexts: [question],
-      nResults: 3
+    console.log(`\n🔍 Question originale : "${question}"`);
+
+    // 1. Multi-query generation
+    console.log(`⏳ Génération de requêtes alternatives...`);
+    const multiQueryPrompt = `Tu es un assistant IA. Ta tâche est de générer 3 formulations différentes pour la question suivante afin d'améliorer la recherche dans une base de données vectorielle. 
+Ne réponds qu'avec les 3 questions, séparées par de simples retours à la ligne, sans puces ni texte introductif.
+Question originale: ${question}`;
+
+    const mqResponse = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: multiQueryPrompt }]
     });
 
-    const relevantDocs = results.documents[0];
+    const variations = mqResponse.choices[0].message.content.split('\n').filter(q => q.trim().length > 0);
+    const searchQueries = [question, ...variations];
+    console.log(`✅ Requêtes utilisées pour la recherche :`);
+    searchQueries.forEach(q => console.log(`   - ${q}`));
 
-    const context = relevantDocs
-      .map((doc, i) => `[Document ${i + 1}] ${doc}`)
+    // 2. Recherche ChromaDB & Déduplication
+    console.log(`⏳ Recherche dans ChromaDB...`);
+    const results = await collection.query({
+      queryTexts: searchQueries,
+      nResults: 2 // On prend les 2 meilleurs pour CHAQUE variante
+    });
+
+    const uniqueDocsMap = new Map();
+    for (let i = 0; i < searchQueries.length; i++) {
+        const queryDocs = results.documents[i];
+        const queryIds = results.ids[i];
+        for (let j = 0; j < queryDocs.length; j++) {
+            if (!uniqueDocsMap.has(queryIds[j])) {
+                uniqueDocsMap.set(queryIds[j], queryDocs[j]);
+            }
+        }
+    }
+    
+    const retrievedDocs = Array.from(uniqueDocsMap.values());
+    console.log(`✅ ${retrievedDocs.length} documents uniques récupérés après déduplication.`);
+
+    // 3. Contextual Compression
+    console.log(`⏳ Compression du contexte...`);
+    const compressedDocs = [];
+    for (let i = 0; i < retrievedDocs.length; i++) {
+      const doc = retrievedDocs[i];
+      const compressPrompt = `Voici un document :
+"${doc}"
+
+Ta tâche : Extraire de ce document UNIQUEMENT les informations pertinentes pour répondre à la question suivante : "${question}".
+Si le document ne contient aucune information pertinente, réponds exactement par "NON_PERTINENT". Ne rajoute aucun autre texte.`;
+
+      const compressResponse = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 300,
+        messages: [{ role: 'user', content: compressPrompt }]
+      });
+
+      const extracted = compressResponse.choices[0].message.content.trim();
+      if (!extracted.includes("NON_PERTINENT")) {
+         compressedDocs.push(extracted);
+      }
+    }
+
+    console.log(`✅ Contexte compressé (${compressedDocs.length} blocs d'informations pertinents retenus).`);
+
+    if (compressedDocs.length === 0) {
+       return "Désolé, je n'ai trouvé aucune information pertinente dans la base de connaissances pour répondre à cette question.";
+    }
+
+    const context = compressedDocs
+      .map((doc, i) => `[Info ${i + 1}] ${doc}`)
       .join('\n\n');
 
-    const prompt = `Voici des documents de référence :
+    // 4. Génération de la réponse (avec Self-RAG basique / vérification)
+    console.log(`⏳ Génération de la réponse finale...`);
+    const finalPrompt = `Tu es un expert technique. Voici des informations extraites de notre documentation de référence par un système RAG :
 
 ${context}
 
-Question : ${question}
+Question de l'utilisateur : ${question}
 
-Réponds en te basant uniquement sur les documents ci-dessus.`;
+Réponds avec précision en te basant UNIQUEMENT sur les segments ci-dessus. Si la réponse ne s'y trouve pas totalement, dis-le clairement, n'invente rien.`;
 
     const response = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       max_tokens: 1024,
-      messages: [{ role: 'user', content: prompt }]
+      messages: [{ role: 'user', content: finalPrompt }]
     });
 
     return response.choices[0].message.content;
